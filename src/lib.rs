@@ -41,6 +41,13 @@ pub struct LaunchCommand {
     pub args: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownTerminalInfo {
+    pub terminal: KnownTerminal,
+    pub label: &'static str,
+    pub program: &'static str,
+}
+
 impl LaunchCommand {
     pub fn new(program: impl Into<String>) -> Self {
         Self {
@@ -219,14 +226,7 @@ impl TerminalEnvironment {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KnownTerminalDetails {
-    terminal: KnownTerminal,
-    label: &'static str,
-    program: &'static str,
-}
-
-impl KnownTerminalDetails {
+impl KnownTerminalInfo {
     fn command(
         self,
         path: &Path,
@@ -300,7 +300,7 @@ impl KnownTerminalDetails {
 pub fn terminal_label(preference: TerminalPreference) -> &'static str {
     match preference {
         TerminalPreference::Auto | TerminalPreference::Custom => "Terminal",
-        TerminalPreference::Known(terminal) => known_terminal(terminal)
+        TerminalPreference::Known(terminal) => known_terminal_info(terminal)
             .map(|terminal| terminal.label)
             .unwrap_or("Terminal"),
     }
@@ -312,7 +312,7 @@ fn named_terminal_command(
     launch_command: Option<&LaunchCommand>,
     available: impl Fn(&str) -> bool,
 ) -> Result<ResolvedTerminalCommand, LaunchError> {
-    let terminal = known_terminal(terminal).expect("known terminal enum should have details");
+    let terminal = known_terminal_info(terminal).expect("known terminal enum should have details");
     if !available(terminal.program) {
         return Err(LaunchError::MissingTerminal {
             label: terminal.label,
@@ -388,71 +388,70 @@ fn append_launch_command(args: &mut Vec<String>, command: &LaunchCommand) {
     args.extend(command.args.iter().cloned());
 }
 
-fn known_terminal(terminal: KnownTerminal) -> Option<KnownTerminalDetails> {
+pub fn known_terminal_info(terminal: KnownTerminal) -> Option<&'static KnownTerminalInfo> {
     known_terminals()
         .iter()
-        .copied()
         .find(|details| details.terminal == terminal)
 }
 
-fn known_terminals() -> &'static [KnownTerminalDetails] {
+pub fn known_terminals() -> &'static [KnownTerminalInfo] {
     &[
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Konsole,
             label: "Konsole",
             program: "konsole",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::GnomeTerminal,
             label: "GNOME Terminal",
             program: "gnome-terminal",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::GnomeConsole,
             label: "GNOME Console",
             program: "kgx",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Xfce4Terminal,
             label: "Xfce Terminal",
             program: "xfce4-terminal",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::MateTerminal,
             label: "MATE Terminal",
             program: "mate-terminal",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Lxterminal,
             label: "LXTerminal",
             program: "lxterminal",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Alacritty,
             label: "Alacritty",
             program: "alacritty",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Ghostty,
             label: "Ghostty",
             program: "ghostty",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Kitty,
             label: "Kitty",
             program: "kitty",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::WezTerm,
             label: "WezTerm",
             program: "wezterm",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Foot,
             label: "Foot",
             program: "foot",
         },
-        KnownTerminalDetails {
+        KnownTerminalInfo {
             terminal: KnownTerminal::Xterm,
             label: "Xterm",
             program: "xterm",
@@ -460,7 +459,7 @@ fn known_terminals() -> &'static [KnownTerminalDetails] {
     ]
 }
 
-fn known_terminal_probe_order() -> Vec<KnownTerminalDetails> {
+fn known_terminal_probe_order() -> Vec<KnownTerminalInfo> {
     [
         KnownTerminal::GnomeTerminal,
         KnownTerminal::GnomeConsole,
@@ -476,11 +475,12 @@ fn known_terminal_probe_order() -> Vec<KnownTerminalDetails> {
         KnownTerminal::Xterm,
     ]
     .into_iter()
-    .filter_map(known_terminal)
+    .filter_map(known_terminal_info)
+    .copied()
     .collect()
 }
 
-fn desktop_terminals(desktop: Option<&str>) -> Vec<KnownTerminalDetails> {
+fn desktop_terminals(desktop: Option<&str>) -> Vec<KnownTerminalInfo> {
     let Some(desktop) = desktop else {
         return Vec::new();
     };
@@ -488,25 +488,28 @@ fn desktop_terminals(desktop: Option<&str>) -> Vec<KnownTerminalDetails> {
     if desktop.contains("kde") {
         return [KnownTerminal::Konsole]
             .into_iter()
-            .filter_map(known_terminal)
+            .filter_map(known_terminal_info)
+            .copied()
             .collect();
     }
     if desktop.contains("gnome") {
         return [KnownTerminal::GnomeConsole, KnownTerminal::GnomeTerminal]
             .into_iter()
-            .filter_map(known_terminal)
+            .filter_map(known_terminal_info)
+            .copied()
             .collect();
     }
     if desktop.contains("xfce") {
         return [KnownTerminal::Xfce4Terminal]
             .into_iter()
-            .filter_map(known_terminal)
+            .filter_map(known_terminal_info)
+            .copied()
             .collect();
     }
     Vec::new()
 }
 
-fn terminal_from_command_spec(command_spec: &str) -> Option<KnownTerminalDetails> {
+fn terminal_from_command_spec(command_spec: &str) -> Option<KnownTerminalInfo> {
     let command = split_command_spec(command_spec).ok()?.into_iter().next()?;
     let command = Path::new(&command).file_name()?.to_string_lossy();
     known_terminals()
@@ -642,6 +645,66 @@ mod tests {
 
     fn launch_command() -> LaunchCommand {
         LaunchCommand::new("cargo").args(["test", "--lib"])
+    }
+
+    fn supported_terminals() -> [KnownTerminal; 12] {
+        [
+            KnownTerminal::Konsole,
+            KnownTerminal::GnomeTerminal,
+            KnownTerminal::GnomeConsole,
+            KnownTerminal::Xfce4Terminal,
+            KnownTerminal::MateTerminal,
+            KnownTerminal::Lxterminal,
+            KnownTerminal::Alacritty,
+            KnownTerminal::Ghostty,
+            KnownTerminal::Kitty,
+            KnownTerminal::WezTerm,
+            KnownTerminal::Foot,
+            KnownTerminal::Xterm,
+        ]
+    }
+
+    #[test]
+    fn known_terminals_exposes_supported_terminal_metadata() {
+        let terminals = known_terminals();
+
+        assert_eq!(terminals.len(), supported_terminals().len());
+        assert_eq!(
+            terminals
+                .iter()
+                .map(|terminal| terminal.terminal)
+                .collect::<Vec<_>>(),
+            supported_terminals()
+        );
+
+        for terminal in terminals {
+            assert!(!terminal.label.is_empty());
+            assert!(!terminal.program.is_empty());
+        }
+    }
+
+    #[test]
+    fn known_terminal_info_returns_entries_from_supported_list() {
+        for terminal in supported_terminals() {
+            let info = known_terminal_info(terminal).expect("terminal metadata should exist");
+            assert_eq!(
+                known_terminals()
+                    .iter()
+                    .find(|candidate| candidate.terminal == terminal),
+                Some(info)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_label_uses_supported_terminal_metadata() {
+        for terminal in supported_terminals() {
+            let info = known_terminal_info(terminal).expect("terminal metadata should exist");
+            assert_eq!(
+                terminal_label(TerminalPreference::Known(terminal)),
+                info.label
+            );
+        }
     }
 
     #[test]

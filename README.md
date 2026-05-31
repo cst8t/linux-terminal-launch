@@ -16,6 +16,20 @@ yet but will be in the future.
 - Optional `serde` feature for serialising preferences in application settings.
 - Licensed under MIT.
 
+## Supported terminals
+
+Use `known_terminals()` to list every known terminal emulator supported by the crate.
+This is a static support list and is not filtered by what is installed on the current system.
+It is intended for settings UIs, documentation, and stable option lists.
+Use `TerminalLauncher::resolve()` or `TerminalLauncher::spawn()` when you need runtime launch behaviour
+for the current machine.
+
+```rust
+for terminal in linux_terminal_launch::known_terminals() {
+    println!("{} ({})", terminal.label, terminal.program);
+}
+```
+
 ## Auto preference order
 
 `TerminalPreference::Auto` resolves the first available terminal in this order:
