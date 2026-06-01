@@ -58,3 +58,23 @@ fn main() -> Result<(), linux_terminal_launch::LaunchError> {
         .spawn()
 }
 ```
+
+GUI applications that open a terminal for the user should usually detach the launched terminal from
+the parent process. This keeps the crate's default inherited-process behaviour unchanged for command
+line callers, while allowing GUI callers to avoid stdio and process-group coupling.
+
+```rust
+use linux_terminal_launch::{KnownTerminal, TerminalLauncher, TerminalPreference};
+
+fn main() -> Result<(), linux_terminal_launch::LaunchError> {
+    TerminalLauncher::new()
+        .working_dir("/home/user/project")
+        .preference(TerminalPreference::Known(KnownTerminal::Ghostty))
+        .detach_from_parent(true)
+        .spawn()
+}
+```
+
+Detached mode redirects stdin, stdout, and stderr to null and starts the terminal in a new Unix
+process group. It does not call `setsid`, and it may not survive launch environments that terminate
+an entire desktop or systemd cgroup.

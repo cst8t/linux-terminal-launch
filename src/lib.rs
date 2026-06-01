@@ -1,7 +1,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +119,7 @@ pub struct TerminalLauncher {
     preference: TerminalPreference,
     custom_command: Option<String>,
     launch_command: Option<LaunchCommand>,
+    detach_from_parent: bool,
     environment: TerminalEnvironment,
 }
 
@@ -129,6 +130,7 @@ impl TerminalLauncher {
             preference: TerminalPreference::Auto,
             custom_command: None,
             launch_command: None,
+            detach_from_parent: false,
             environment: TerminalEnvironment::current(),
         }
     }
@@ -153,6 +155,11 @@ impl TerminalLauncher {
         self
     }
 
+    pub fn detach_from_parent(mut self, detach: bool) -> Self {
+        self.detach_from_parent = detach;
+        self
+    }
+
     pub fn resolve(&self) -> Result<ResolvedTerminalCommand, LaunchError> {
         let path = self
             .working_dir
@@ -168,9 +175,13 @@ impl TerminalLauncher {
             .as_deref()
             .unwrap_or_else(|| Path::new("."));
 
-        Command::new(&command.program)
-            .args(&command.args)
-            .current_dir(path)
+        let mut process = Command::new(&command.program);
+        process.args(&command.args).current_dir(path);
+        if self.detach_from_parent {
+            configure_detached_process(&mut process);
+        }
+
+        process
             .spawn()
             .map(|_| ())
             .map_err(|source| LaunchError::SpawnFailure {
@@ -201,6 +212,20 @@ impl TerminalLauncher {
                 named_terminal_command(selected, path, self.launch_command.as_ref(), available)
             }
         }
+    }
+}
+
+fn configure_detached_process(command: &mut Command) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
     }
 }
 
@@ -628,6 +653,7 @@ mod tests {
             preference,
             custom_command: None,
             launch_command: None,
+            detach_from_parent: false,
             environment: TerminalEnvironment {
                 terminal: terminal.map(str::to_string),
                 current_desktop: desktop.map(str::to_string),
@@ -645,6 +671,20 @@ mod tests {
 
     fn launch_command() -> LaunchCommand {
         LaunchCommand::new("cargo").args(["test", "--lib"])
+    }
+
+    #[test]
+    fn launcher_inherits_parent_lifetime_by_default() {
+        assert!(!TerminalLauncher::new().detach_from_parent);
+    }
+
+    #[test]
+    fn detach_from_parent_sets_launcher_lifetime_preference() {
+        assert!(
+            TerminalLauncher::new()
+                .detach_from_parent(true)
+                .detach_from_parent
+        );
     }
 
     fn supported_terminals() -> [KnownTerminal; 12] {
