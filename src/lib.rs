@@ -355,13 +355,27 @@ fn auto_terminal_command(
 ) -> Result<ResolvedTerminalCommand, LaunchError> {
     let mut found_unsupported_launcher = false;
 
-    if let Some(terminal) = environment
+    if let Some(parts) = environment
         .terminal
         .as_deref()
-        .and_then(terminal_from_command_spec)
+        .and_then(|terminal| split_command_spec(terminal).ok())
+        .filter(|parts| !parts.is_empty())
     {
-        if available(terminal.program) {
-            return terminal.command(path, launch_command);
+        let program = &parts[0];
+        if let Some(terminal) = known_terminal_from_command(program) {
+            if available(terminal.program) {
+                return terminal.command(path, launch_command);
+            }
+        } else if available(program) {
+            if launch_command.is_some() {
+                found_unsupported_launcher = true;
+            } else {
+                return Ok(ResolvedTerminalCommand {
+                    label: "Terminal",
+                    program: program.clone(),
+                    args: parts[1..].to_vec(),
+                });
+            }
         }
     }
 
@@ -534,8 +548,7 @@ fn desktop_terminals(desktop: Option<&str>) -> Vec<KnownTerminalInfo> {
     Vec::new()
 }
 
-fn terminal_from_command_spec(command_spec: &str) -> Option<KnownTerminalInfo> {
-    let command = split_command_spec(command_spec).ok()?.into_iter().next()?;
+fn known_terminal_from_command(command: &str) -> Option<KnownTerminalInfo> {
     let command = Path::new(&command).file_name()?.to_string_lossy();
     known_terminals()
         .iter()
@@ -1002,6 +1015,88 @@ mod tests {
             .expect("terminal should resolve");
 
         assert_eq!(command.program, "kitty");
+    }
+
+    #[test]
+    fn auto_prefers_unknown_executable_terminal_environment() {
+        let command = launcher(TerminalPreference::Auto, Some("coolterm"), Some("KDE"))
+            .resolve_with(
+                path(),
+                available(&["coolterm", "xdg-terminal-exec", "konsole", "gnome-terminal"]),
+            )
+            .expect("terminal should resolve");
+
+        assert_eq!(command.program, "coolterm");
+        assert!(command.args.is_empty());
+    }
+
+    #[test]
+    fn auto_preserves_unknown_terminal_environment_args() {
+        let command = launcher(
+            TerminalPreference::Auto,
+            Some("coolterm --title 'Repo Terminal' --cwd {path}"),
+            Some("KDE"),
+        )
+        .resolve_with(path(), available(&["coolterm"]))
+        .expect("terminal should resolve");
+
+        assert_eq!(command.program, "coolterm");
+        assert_eq!(
+            command.args,
+            vec!["--title", "Repo Terminal", "--cwd", "{path}"]
+        );
+    }
+
+    #[test]
+    fn auto_ignores_unavailable_unknown_terminal_environment() {
+        let command = launcher(
+            TerminalPreference::Auto,
+            Some("coolterm --new-window"),
+            Some("KDE"),
+        )
+        .resolve_with(path(), available(&["xdg-terminal-exec", "konsole"]))
+        .expect("terminal should resolve");
+
+        assert_eq!(command.program, "xdg-terminal-exec");
+    }
+
+    #[test]
+    fn auto_skips_unknown_terminal_environment_with_launch_command() {
+        let command = launcher(TerminalPreference::Auto, Some("coolterm"), Some("KDE"))
+            .launch_command(launch_command())
+            .resolve_with(path(), available(&["coolterm", "konsole"]))
+            .expect("known terminal should resolve");
+
+        assert_eq!(command.program, "konsole");
+        assert_eq!(
+            command.args,
+            vec![
+                "--workdir",
+                "/tmp/repo with spaces",
+                "-e",
+                "cargo",
+                "test",
+                "--lib"
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_rejects_unknown_terminal_environment_with_launch_command_when_no_known_terminal_exists()
+    {
+        let error = launcher(TerminalPreference::Auto, Some("coolterm"), None)
+            .launch_command(launch_command())
+            .resolve_with(path(), available(&["coolterm"]))
+            .expect_err("generic terminal should reject launch command");
+
+        assert!(matches!(
+            error,
+            LaunchError::UnsupportedLaunchCommand { .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Terminal does not support a structured launch command"
+        );
     }
 
     #[test]

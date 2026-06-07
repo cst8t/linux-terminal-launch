@@ -34,7 +34,7 @@ for terminal in linux_terminal_launch::known_terminals() {
 
 `TerminalPreference::Auto` resolves the first available terminal in this order:
 
-1. A known terminal named by the `TERMINAL` environment variable.
+1. A terminal named by the `TERMINAL` environment variable, when it is either a supported known terminal or another executable command.
 2. `xdg-terminal-exec`.
 3. The current desktop environment heuristic:
    - KDE: Konsole.
