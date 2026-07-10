@@ -3,11 +3,15 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+mod registry;
+pub use registry::{TerminalDefinition, TerminalRegistry};
+
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalPreference {
     Auto,
     Known(KnownTerminal),
+    Registered(String),
     Custom,
 }
 
@@ -30,7 +34,7 @@ pub enum KnownTerminal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedTerminalCommand {
-    pub label: &'static str,
+    pub label: String,
     pub program: String,
     pub args: Vec<String>,
 }
@@ -71,22 +75,20 @@ impl LaunchCommand {
     }
 }
 
+impl TerminalPreference {
+    pub fn registered(id: impl Into<String>) -> Self {
+        Self::Registered(id.into())
+    }
+}
+
 #[derive(Debug)]
 pub enum LaunchError {
-    MissingTerminal {
-        label: &'static str,
-        program: &'static str,
-    },
+    MissingTerminal { label: String, program: String },
     EmptyCustomCommand,
     MalformedCustomCommand(String),
-    UnsupportedLaunchCommand {
-        label: &'static str,
-    },
+    UnsupportedLaunchCommand { label: String },
     NoSupportedTerminal,
-    SpawnFailure {
-        label: &'static str,
-        source: io::Error,
-    },
+    SpawnFailure { label: String, source: io::Error },
 }
 
 impl fmt::Display for LaunchError {
@@ -121,6 +123,7 @@ pub struct TerminalLauncher {
     launch_command: Option<LaunchCommand>,
     detach_from_parent: bool,
     environment: TerminalEnvironment,
+    registry: TerminalRegistry,
 }
 
 impl TerminalLauncher {
@@ -132,6 +135,7 @@ impl TerminalLauncher {
             launch_command: None,
             detach_from_parent: false,
             environment: TerminalEnvironment::current(),
+            registry: TerminalRegistry::with_known_terminals(),
         }
     }
 
@@ -147,6 +151,11 @@ impl TerminalLauncher {
 
     pub fn custom_command(mut self, command: impl Into<String>) -> Self {
         self.custom_command = Some(command.into());
+        self
+    }
+
+    pub fn registry(mut self, registry: TerminalRegistry) -> Self {
+        self.registry = registry;
         self
     }
 
@@ -195,9 +204,11 @@ impl TerminalLauncher {
         path: &Path,
         available: impl Fn(&str) -> bool,
     ) -> Result<ResolvedTerminalCommand, LaunchError> {
-        match self.preference {
+        match &self.preference {
             TerminalPreference::Custom if self.launch_command.is_some() => {
-                Err(LaunchError::UnsupportedLaunchCommand { label: "Terminal" })
+                Err(LaunchError::UnsupportedLaunchCommand {
+                    label: "Terminal".to_string(),
+                })
             }
             TerminalPreference::Custom => {
                 custom_terminal_command(self.custom_command.as_deref().unwrap_or_default(), path)
@@ -206,11 +217,23 @@ impl TerminalLauncher {
                 path,
                 self.launch_command.as_ref(),
                 &self.environment,
-                available,
+                &self.registry,
+                &available,
             ),
-            TerminalPreference::Known(selected) => {
-                named_terminal_command(selected, path, self.launch_command.as_ref(), available)
-            }
+            TerminalPreference::Known(selected) => named_terminal_command(
+                *selected,
+                path,
+                self.launch_command.as_ref(),
+                &self.registry,
+                &available,
+            ),
+            TerminalPreference::Registered(selected) => registered_terminal_command(
+                selected,
+                path,
+                self.launch_command.as_ref(),
+                &self.registry,
+                &available,
+            ),
         }
     }
 }
@@ -251,83 +274,14 @@ impl TerminalEnvironment {
     }
 }
 
-impl KnownTerminalInfo {
-    fn command(
-        self,
-        path: &Path,
-        launch_command: Option<&LaunchCommand>,
-    ) -> Result<ResolvedTerminalCommand, LaunchError> {
-        let path = path.to_string_lossy().to_string();
-        let mut args = match self.terminal {
-            KnownTerminal::Konsole => vec!["--workdir".to_string(), path],
-            KnownTerminal::GnomeTerminal
-            | KnownTerminal::GnomeConsole
-            | KnownTerminal::Xfce4Terminal
-            | KnownTerminal::MateTerminal
-            | KnownTerminal::Alacritty => vec!["--working-directory".to_string(), path],
-            KnownTerminal::Lxterminal | KnownTerminal::Ghostty | KnownTerminal::Foot => {
-                vec![format!("--working-directory={path}")]
-            }
-            KnownTerminal::Kitty => vec!["--directory".to_string(), path],
-            KnownTerminal::WezTerm => vec!["start".to_string(), "--cwd".to_string(), path],
-            KnownTerminal::Xterm if launch_command.is_some() => vec![
-                "-e".to_string(),
-                "sh".to_string(),
-                "-lc".to_string(),
-                "cd \"$1\" || exit; shift; exec \"$@\"".to_string(),
-                "sh".to_string(),
-                path,
-            ],
-            KnownTerminal::Xterm => vec![
-                "-e".to_string(),
-                "sh".to_string(),
-                "-lc".to_string(),
-                "cd \"$1\" || exit; exec \"${SHELL:-sh}\"".to_string(),
-                "sh".to_string(),
-                path,
-            ],
-        };
-
-        if let Some(command) = launch_command {
-            match self.terminal {
-                KnownTerminal::Konsole
-                | KnownTerminal::Lxterminal
-                | KnownTerminal::Alacritty
-                | KnownTerminal::Ghostty => {
-                    args.push("-e".to_string());
-                    append_launch_command(&mut args, command);
-                }
-                KnownTerminal::GnomeTerminal
-                | KnownTerminal::GnomeConsole
-                | KnownTerminal::Kitty => {
-                    args.push("--".to_string());
-                    append_launch_command(&mut args, command);
-                }
-                KnownTerminal::Xfce4Terminal | KnownTerminal::MateTerminal => {
-                    args.push("-x".to_string());
-                    append_launch_command(&mut args, command);
-                }
-                KnownTerminal::WezTerm | KnownTerminal::Foot => {
-                    append_launch_command(&mut args, command)
-                }
-                KnownTerminal::Xterm => append_launch_command(&mut args, command),
-            }
-        }
-
-        Ok(ResolvedTerminalCommand {
-            label: self.label,
-            program: self.program.to_string(),
-            args,
-        })
-    }
-}
-
-pub fn terminal_label(preference: TerminalPreference) -> &'static str {
+pub fn terminal_label(preference: TerminalPreference) -> String {
     match preference {
-        TerminalPreference::Auto | TerminalPreference::Custom => "Terminal",
+        TerminalPreference::Auto | TerminalPreference::Custom => "Terminal".to_string(),
         TerminalPreference::Known(terminal) => known_terminal_info(terminal)
             .map(|terminal| terminal.label)
-            .unwrap_or("Terminal"),
+            .unwrap_or("Terminal")
+            .to_string(),
+        TerminalPreference::Registered(identifier) => identifier,
     }
 }
 
@@ -335,15 +289,48 @@ fn named_terminal_command(
     terminal: KnownTerminal,
     path: &Path,
     launch_command: Option<&LaunchCommand>,
-    available: impl Fn(&str) -> bool,
+    registry: &TerminalRegistry,
+    available: &impl Fn(&str) -> bool,
 ) -> Result<ResolvedTerminalCommand, LaunchError> {
-    let terminal = known_terminal_info(terminal).expect("known terminal enum should have details");
-    if !available(terminal.program) {
+    let Some(definition) = registry.known(terminal) else {
+        let terminal =
+            known_terminal_info(terminal).expect("known terminal enum should have details");
         return Err(LaunchError::MissingTerminal {
-            label: terminal.label,
-            program: terminal.program,
+            label: terminal.label.to_string(),
+            program: terminal.program.to_string(),
+        });
+    };
+
+    if !available(definition.program()) {
+        return Err(LaunchError::MissingTerminal {
+            label: definition.label().to_string(),
+            program: definition.program().to_string(),
         });
     }
+    definition.command(path, launch_command)
+}
+
+fn registered_terminal_command(
+    identifier: &str,
+    path: &Path,
+    launch_command: Option<&LaunchCommand>,
+    registry: &TerminalRegistry,
+    available: &impl Fn(&str) -> bool,
+) -> Result<ResolvedTerminalCommand, LaunchError> {
+    let terminal = registry
+        .registered(identifier)
+        .ok_or_else(|| LaunchError::MissingTerminal {
+            label: identifier.to_string(),
+            program: identifier.to_string(),
+        })?;
+
+    if !available(terminal.program()) {
+        return Err(LaunchError::MissingTerminal {
+            label: terminal.label().to_string(),
+            program: terminal.program().to_string(),
+        });
+    }
+
     terminal.command(path, launch_command)
 }
 
@@ -351,7 +338,8 @@ fn auto_terminal_command(
     path: &Path,
     launch_command: Option<&LaunchCommand>,
     environment: &TerminalEnvironment,
-    available: impl Fn(&str) -> bool,
+    registry: &TerminalRegistry,
+    available: &impl Fn(&str) -> bool,
 ) -> Result<ResolvedTerminalCommand, LaunchError> {
     let mut found_unsupported_launcher = false;
 
@@ -362,8 +350,8 @@ fn auto_terminal_command(
         .filter(|parts| !parts.is_empty())
     {
         let program = &parts[0];
-        if let Some(terminal) = known_terminal_from_command(program) {
-            if available(terminal.program) {
+        if let Some(terminal) = registry.definition_for_command(program) {
+            if available(terminal.program()) {
                 return terminal.command(path, launch_command);
             }
         } else if available(program) {
@@ -371,7 +359,7 @@ fn auto_terminal_command(
                 found_unsupported_launcher = true;
             } else {
                 return Ok(ResolvedTerminalCommand {
-                    label: "Terminal",
+                    label: "Terminal".to_string(),
                     program: program.clone(),
                     args: parts[1..].to_vec(),
                 });
@@ -384,21 +372,21 @@ fn auto_terminal_command(
             found_unsupported_launcher = true;
         } else {
             return Ok(ResolvedTerminalCommand {
-                label: "Terminal",
+                label: "Terminal".to_string(),
                 program: "xdg-terminal-exec".to_string(),
                 args: vec![format!("--dir={}", path.display())],
             });
         }
     }
 
-    for terminal in desktop_terminals(environment.current_desktop.as_deref()) {
-        if available(terminal.program) {
+    for terminal in registry.desktop_terminals(environment.current_desktop.as_deref()) {
+        if available(terminal.program()) {
             return terminal.command(path, launch_command);
         }
     }
 
-    for terminal in known_terminal_probe_order() {
-        if available(terminal.program) {
+    for terminal in registry.definitions() {
+        if available(terminal.program()) {
             return terminal.command(path, launch_command);
         }
     }
@@ -408,7 +396,7 @@ fn auto_terminal_command(
             found_unsupported_launcher = true;
         } else {
             return Ok(ResolvedTerminalCommand {
-                label: "Terminal",
+                label: "Terminal".to_string(),
                 program: "x-terminal-emulator".to_string(),
                 args: Vec::new(),
             });
@@ -416,15 +404,12 @@ fn auto_terminal_command(
     }
 
     if found_unsupported_launcher {
-        return Err(LaunchError::UnsupportedLaunchCommand { label: "Terminal" });
+        return Err(LaunchError::UnsupportedLaunchCommand {
+            label: "Terminal".to_string(),
+        });
     }
 
     Err(LaunchError::NoSupportedTerminal)
-}
-
-fn append_launch_command(args: &mut Vec<String>, command: &LaunchCommand) {
-    args.push(command.program.clone());
-    args.extend(command.args.iter().cloned());
 }
 
 pub fn known_terminal_info(terminal: KnownTerminal) -> Option<&'static KnownTerminalInfo> {
@@ -498,64 +483,6 @@ pub fn known_terminals() -> &'static [KnownTerminalInfo] {
     ]
 }
 
-fn known_terminal_probe_order() -> Vec<KnownTerminalInfo> {
-    [
-        KnownTerminal::GnomeTerminal,
-        KnownTerminal::GnomeConsole,
-        KnownTerminal::Konsole,
-        KnownTerminal::Xfce4Terminal,
-        KnownTerminal::MateTerminal,
-        KnownTerminal::Lxterminal,
-        KnownTerminal::Alacritty,
-        KnownTerminal::Ghostty,
-        KnownTerminal::Kitty,
-        KnownTerminal::WezTerm,
-        KnownTerminal::Foot,
-        KnownTerminal::Xterm,
-    ]
-    .into_iter()
-    .filter_map(known_terminal_info)
-    .copied()
-    .collect()
-}
-
-fn desktop_terminals(desktop: Option<&str>) -> Vec<KnownTerminalInfo> {
-    let Some(desktop) = desktop else {
-        return Vec::new();
-    };
-    let desktop = desktop.to_ascii_lowercase();
-    if desktop.contains("kde") {
-        return [KnownTerminal::Konsole]
-            .into_iter()
-            .filter_map(known_terminal_info)
-            .copied()
-            .collect();
-    }
-    if desktop.contains("gnome") {
-        return [KnownTerminal::GnomeConsole, KnownTerminal::GnomeTerminal]
-            .into_iter()
-            .filter_map(known_terminal_info)
-            .copied()
-            .collect();
-    }
-    if desktop.contains("xfce") {
-        return [KnownTerminal::Xfce4Terminal]
-            .into_iter()
-            .filter_map(known_terminal_info)
-            .copied()
-            .collect();
-    }
-    Vec::new()
-}
-
-fn known_terminal_from_command(command: &str) -> Option<KnownTerminalInfo> {
-    let command = Path::new(&command).file_name()?.to_string_lossy();
-    known_terminals()
-        .iter()
-        .copied()
-        .find(|terminal| terminal.program == command)
-}
-
 fn custom_terminal_command(
     command_spec: &str,
     path: &Path,
@@ -573,7 +500,7 @@ fn custom_terminal_command(
         .collect();
 
     Ok(ResolvedTerminalCommand {
-        label: "Terminal",
+        label: "Terminal".to_string(),
         program,
         args,
     })
@@ -648,659 +575,4 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashSet;
-
-    fn path() -> &'static Path {
-        Path::new("/tmp/repo with spaces")
-    }
-
-    fn launcher(
-        preference: TerminalPreference,
-        terminal: Option<&str>,
-        desktop: Option<&str>,
-    ) -> TerminalLauncher {
-        TerminalLauncher {
-            working_dir: Some(path().to_path_buf()),
-            preference,
-            custom_command: None,
-            launch_command: None,
-            detach_from_parent: false,
-            environment: TerminalEnvironment {
-                terminal: terminal.map(str::to_string),
-                current_desktop: desktop.map(str::to_string),
-            },
-        }
-    }
-
-    fn available(commands: &[&str]) -> impl Fn(&str) -> bool {
-        let commands = commands
-            .iter()
-            .map(|command| command.to_string())
-            .collect::<HashSet<_>>();
-        move |command| commands.contains(command)
-    }
-
-    fn launch_command() -> LaunchCommand {
-        LaunchCommand::new("cargo").args(["test", "--lib"])
-    }
-
-    #[test]
-    fn launcher_inherits_parent_lifetime_by_default() {
-        assert!(!TerminalLauncher::new().detach_from_parent);
-    }
-
-    #[test]
-    fn detach_from_parent_sets_launcher_lifetime_preference() {
-        assert!(
-            TerminalLauncher::new()
-                .detach_from_parent(true)
-                .detach_from_parent
-        );
-    }
-
-    fn supported_terminals() -> [KnownTerminal; 12] {
-        [
-            KnownTerminal::Konsole,
-            KnownTerminal::GnomeTerminal,
-            KnownTerminal::GnomeConsole,
-            KnownTerminal::Xfce4Terminal,
-            KnownTerminal::MateTerminal,
-            KnownTerminal::Lxterminal,
-            KnownTerminal::Alacritty,
-            KnownTerminal::Ghostty,
-            KnownTerminal::Kitty,
-            KnownTerminal::WezTerm,
-            KnownTerminal::Foot,
-            KnownTerminal::Xterm,
-        ]
-    }
-
-    #[test]
-    fn known_terminals_exposes_supported_terminal_metadata() {
-        let terminals = known_terminals();
-
-        assert_eq!(terminals.len(), supported_terminals().len());
-        assert_eq!(
-            terminals
-                .iter()
-                .map(|terminal| terminal.terminal)
-                .collect::<Vec<_>>(),
-            supported_terminals()
-        );
-
-        for terminal in terminals {
-            assert!(!terminal.label.is_empty());
-            assert!(!terminal.program.is_empty());
-        }
-    }
-
-    #[test]
-    fn known_terminal_info_returns_entries_from_supported_list() {
-        for terminal in supported_terminals() {
-            let info = known_terminal_info(terminal).expect("terminal metadata should exist");
-            assert_eq!(
-                known_terminals()
-                    .iter()
-                    .find(|candidate| candidate.terminal == terminal),
-                Some(info)
-            );
-        }
-    }
-
-    #[test]
-    fn terminal_label_uses_supported_terminal_metadata() {
-        for terminal in supported_terminals() {
-            let info = known_terminal_info(terminal).expect("terminal metadata should exist");
-            assert_eq!(
-                terminal_label(TerminalPreference::Known(terminal)),
-                info.label
-            );
-        }
-    }
-
-    #[test]
-    fn known_terminals_emit_expected_working_directory_arguments() {
-        let cases = [
-            (
-                KnownTerminal::Konsole,
-                "konsole",
-                vec!["--workdir", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::GnomeTerminal,
-                "gnome-terminal",
-                vec!["--working-directory", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::GnomeConsole,
-                "kgx",
-                vec!["--working-directory", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::Xfce4Terminal,
-                "xfce4-terminal",
-                vec!["--working-directory", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::MateTerminal,
-                "mate-terminal",
-                vec!["--working-directory", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::Lxterminal,
-                "lxterminal",
-                vec!["--working-directory=/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::Alacritty,
-                "alacritty",
-                vec!["--working-directory", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::Ghostty,
-                "ghostty",
-                vec!["--working-directory=/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::Kitty,
-                "kitty",
-                vec!["--directory", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::WezTerm,
-                "wezterm",
-                vec!["start", "--cwd", "/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::Foot,
-                "foot",
-                vec!["--working-directory=/tmp/repo with spaces"],
-            ),
-            (
-                KnownTerminal::Xterm,
-                "xterm",
-                vec![
-                    "-e",
-                    "sh",
-                    "-lc",
-                    "cd \"$1\" || exit; exec \"${SHELL:-sh}\"",
-                    "sh",
-                    "/tmp/repo with spaces",
-                ],
-            ),
-        ];
-
-        for (terminal, program, args) in cases {
-            let command = launcher(TerminalPreference::Known(terminal), None, None)
-                .resolve_with(path(), available(&[program]))
-                .expect("terminal should resolve");
-            assert_eq!(command.program, program);
-            assert_eq!(
-                command.args,
-                args.into_iter().map(str::to_string).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn known_terminals_emit_expected_launch_command_arguments() {
-        let cases = [
-            (
-                KnownTerminal::Konsole,
-                "konsole",
-                vec![
-                    "--workdir",
-                    "/tmp/repo with spaces",
-                    "-e",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::GnomeTerminal,
-                "gnome-terminal",
-                vec![
-                    "--working-directory",
-                    "/tmp/repo with spaces",
-                    "--",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::GnomeConsole,
-                "kgx",
-                vec![
-                    "--working-directory",
-                    "/tmp/repo with spaces",
-                    "--",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::Xfce4Terminal,
-                "xfce4-terminal",
-                vec![
-                    "--working-directory",
-                    "/tmp/repo with spaces",
-                    "-x",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::MateTerminal,
-                "mate-terminal",
-                vec![
-                    "--working-directory",
-                    "/tmp/repo with spaces",
-                    "-x",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::Lxterminal,
-                "lxterminal",
-                vec![
-                    "--working-directory=/tmp/repo with spaces",
-                    "-e",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::Alacritty,
-                "alacritty",
-                vec![
-                    "--working-directory",
-                    "/tmp/repo with spaces",
-                    "-e",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::Ghostty,
-                "ghostty",
-                vec![
-                    "--working-directory=/tmp/repo with spaces",
-                    "-e",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::Kitty,
-                "kitty",
-                vec![
-                    "--directory",
-                    "/tmp/repo with spaces",
-                    "--",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::WezTerm,
-                "wezterm",
-                vec![
-                    "start",
-                    "--cwd",
-                    "/tmp/repo with spaces",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::Foot,
-                "foot",
-                vec![
-                    "--working-directory=/tmp/repo with spaces",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-            (
-                KnownTerminal::Xterm,
-                "xterm",
-                vec![
-                    "-e",
-                    "sh",
-                    "-lc",
-                    "cd \"$1\" || exit; shift; exec \"$@\"",
-                    "sh",
-                    "/tmp/repo with spaces",
-                    "cargo",
-                    "test",
-                    "--lib",
-                ],
-            ),
-        ];
-
-        for (terminal, program, args) in cases {
-            let command = launcher(TerminalPreference::Known(terminal), None, None)
-                .launch_command(launch_command())
-                .resolve_with(path(), available(&[program]))
-                .expect("terminal should resolve");
-            assert_eq!(command.program, program);
-            assert_eq!(
-                command.args,
-                args.into_iter().map(str::to_string).collect::<Vec<_>>()
-            );
-        }
-    }
-
-    #[test]
-    fn auto_prefers_mapped_terminal_environment() {
-        let command = launcher(TerminalPreference::Auto, Some("kitty"), Some("KDE"))
-            .resolve_with(
-                path(),
-                available(&["kitty", "konsole", "xdg-terminal-exec"]),
-            )
-            .expect("terminal should resolve");
-
-        assert_eq!(command.program, "kitty");
-    }
-
-    #[test]
-    fn auto_prefers_unknown_executable_terminal_environment() {
-        let command = launcher(TerminalPreference::Auto, Some("coolterm"), Some("KDE"))
-            .resolve_with(
-                path(),
-                available(&["coolterm", "xdg-terminal-exec", "konsole", "gnome-terminal"]),
-            )
-            .expect("terminal should resolve");
-
-        assert_eq!(command.program, "coolterm");
-        assert!(command.args.is_empty());
-    }
-
-    #[test]
-    fn auto_preserves_unknown_terminal_environment_args() {
-        let command = launcher(
-            TerminalPreference::Auto,
-            Some("coolterm --title 'Repo Terminal' --cwd {path}"),
-            Some("KDE"),
-        )
-        .resolve_with(path(), available(&["coolterm"]))
-        .expect("terminal should resolve");
-
-        assert_eq!(command.program, "coolterm");
-        assert_eq!(
-            command.args,
-            vec!["--title", "Repo Terminal", "--cwd", "{path}"]
-        );
-    }
-
-    #[test]
-    fn auto_ignores_unavailable_unknown_terminal_environment() {
-        let command = launcher(
-            TerminalPreference::Auto,
-            Some("coolterm --new-window"),
-            Some("KDE"),
-        )
-        .resolve_with(path(), available(&["xdg-terminal-exec", "konsole"]))
-        .expect("terminal should resolve");
-
-        assert_eq!(command.program, "xdg-terminal-exec");
-    }
-
-    #[test]
-    fn auto_skips_unknown_terminal_environment_with_launch_command() {
-        let command = launcher(TerminalPreference::Auto, Some("coolterm"), Some("KDE"))
-            .launch_command(launch_command())
-            .resolve_with(path(), available(&["coolterm", "konsole"]))
-            .expect("known terminal should resolve");
-
-        assert_eq!(command.program, "konsole");
-        assert_eq!(
-            command.args,
-            vec![
-                "--workdir",
-                "/tmp/repo with spaces",
-                "-e",
-                "cargo",
-                "test",
-                "--lib"
-            ]
-        );
-    }
-
-    #[test]
-    fn auto_rejects_unknown_terminal_environment_with_launch_command_when_no_known_terminal_exists()
-    {
-        let error = launcher(TerminalPreference::Auto, Some("coolterm"), None)
-            .launch_command(launch_command())
-            .resolve_with(path(), available(&["coolterm"]))
-            .expect_err("generic terminal should reject launch command");
-
-        assert!(matches!(
-            error,
-            LaunchError::UnsupportedLaunchCommand { .. }
-        ));
-        assert_eq!(
-            error.to_string(),
-            "Terminal does not support a structured launch command"
-        );
-    }
-
-    #[test]
-    fn auto_uses_xdg_terminal_exec_before_desktop_heuristic() {
-        let command = launcher(TerminalPreference::Auto, None, Some("KDE"))
-            .resolve_with(path(), available(&["xdg-terminal-exec", "konsole"]))
-            .expect("terminal should resolve");
-
-        assert_eq!(command.program, "xdg-terminal-exec");
-        assert_eq!(command.args, vec!["--dir=/tmp/repo with spaces"]);
-    }
-
-    #[test]
-    fn auto_skips_xdg_terminal_exec_with_launch_command() {
-        let command = launcher(TerminalPreference::Auto, None, Some("KDE"))
-            .launch_command(launch_command())
-            .resolve_with(path(), available(&["xdg-terminal-exec", "konsole"]))
-            .expect("known terminal should resolve");
-
-        assert_eq!(command.program, "konsole");
-        assert_eq!(
-            command.args,
-            vec![
-                "--workdir",
-                "/tmp/repo with spaces",
-                "-e",
-                "cargo",
-                "test",
-                "--lib"
-            ]
-        );
-    }
-
-    #[test]
-    fn auto_rejects_xdg_terminal_exec_with_launch_command_when_no_known_terminal_exists() {
-        let error = launcher(TerminalPreference::Auto, None, None)
-            .launch_command(launch_command())
-            .resolve_with(path(), available(&["xdg-terminal-exec"]))
-            .expect_err("generic terminal should reject launch command");
-
-        assert!(matches!(
-            error,
-            LaunchError::UnsupportedLaunchCommand { .. }
-        ));
-        assert_eq!(
-            error.to_string(),
-            "Terminal does not support a structured launch command"
-        );
-    }
-
-    #[test]
-    fn auto_uses_desktop_heuristic_before_probe_order() {
-        let command = launcher(TerminalPreference::Auto, None, Some("KDE"))
-            .resolve_with(path(), available(&["gnome-terminal", "konsole"]))
-            .expect("terminal should resolve");
-
-        assert_eq!(command.program, "konsole");
-    }
-
-    #[test]
-    fn auto_falls_back_to_probe_order_then_x_terminal_emulator() {
-        let probed = launcher(TerminalPreference::Auto, None, None)
-            .resolve_with(path(), available(&["kitty"]))
-            .expect("terminal should resolve");
-        assert_eq!(probed.program, "kitty");
-
-        let debian_fallback = launcher(TerminalPreference::Auto, None, None)
-            .resolve_with(path(), available(&["x-terminal-emulator"]))
-            .expect("terminal should resolve");
-        assert_eq!(debian_fallback.program, "x-terminal-emulator");
-        assert!(debian_fallback.args.is_empty());
-    }
-
-    #[test]
-    fn auto_rejects_x_terminal_emulator_with_launch_command() {
-        let error = launcher(TerminalPreference::Auto, None, None)
-            .launch_command(launch_command())
-            .resolve_with(path(), available(&["x-terminal-emulator"]))
-            .expect_err("generic fallback should reject launch command");
-
-        assert!(matches!(
-            error,
-            LaunchError::UnsupportedLaunchCommand { .. }
-        ));
-        assert_eq!(
-            error.to_string(),
-            "Terminal does not support a structured launch command"
-        );
-    }
-
-    #[test]
-    fn custom_command_replaces_path_and_keeps_spaces() {
-        let command = TerminalLauncher {
-            custom_command: Some("my-terminal --working-directory \"{path}\" --flag".to_string()),
-            ..launcher(TerminalPreference::Custom, None, None)
-        }
-        .resolve_with(path(), available(&[]))
-        .expect("custom command should parse");
-
-        assert_eq!(command.program, "my-terminal");
-        assert_eq!(
-            command.args,
-            vec!["--working-directory", "/tmp/repo with spaces", "--flag"]
-        );
-    }
-
-    #[test]
-    fn custom_command_can_omit_path_argument() {
-        let command = TerminalLauncher {
-            custom_command: Some("my-terminal --new-window".to_string()),
-            ..launcher(TerminalPreference::Custom, None, None)
-        }
-        .resolve_with(path(), available(&[]))
-        .expect("custom command should parse");
-
-        assert_eq!(command.program, "my-terminal");
-        assert_eq!(command.args, vec!["--new-window"]);
-    }
-
-    #[test]
-    fn custom_command_keeps_quoted_arguments_together() {
-        let command = TerminalLauncher {
-            custom_command: Some("my-terminal --title 'Repo Terminal'".to_string()),
-            ..launcher(TerminalPreference::Custom, None, None)
-        }
-        .resolve_with(path(), available(&[]))
-        .expect("custom command should parse");
-
-        assert_eq!(command.args, vec!["--title", "Repo Terminal"]);
-    }
-
-    #[test]
-    fn custom_command_rejects_unterminated_quotes() {
-        let error = TerminalLauncher {
-            custom_command: Some("my-terminal --title \"Repo".to_string()),
-            ..launcher(TerminalPreference::Custom, None, None)
-        }
-        .resolve_with(path(), available(&[]))
-        .expect_err("custom command should fail");
-
-        assert!(matches!(error, LaunchError::MalformedCustomCommand(_)));
-        assert_eq!(
-            error.to_string(),
-            "Custom terminal command has an unterminated quote"
-        );
-    }
-
-    #[test]
-    fn custom_command_rejects_empty_command() {
-        let error = TerminalLauncher {
-            custom_command: Some("   ".to_string()),
-            ..launcher(TerminalPreference::Custom, None, None)
-        }
-        .resolve_with(path(), available(&[]))
-        .expect_err("custom command should fail");
-
-        assert!(matches!(error, LaunchError::EmptyCustomCommand));
-        assert_eq!(error.to_string(), "Custom terminal command cannot be empty");
-    }
-
-    #[test]
-    fn custom_command_rejects_launch_command() {
-        let error = TerminalLauncher {
-            custom_command: Some("my-terminal --working-directory \"{path}\"".to_string()),
-            ..launcher(TerminalPreference::Custom, None, None)
-        }
-        .launch_command(launch_command())
-        .resolve_with(path(), available(&[]))
-        .expect_err("custom terminal should reject launch command");
-
-        assert!(matches!(
-            error,
-            LaunchError::UnsupportedLaunchCommand { .. }
-        ));
-        assert_eq!(
-            error.to_string(),
-            "Terminal does not support a structured launch command"
-        );
-    }
-
-    #[test]
-    fn missing_named_terminal_returns_clear_error() {
-        let error = launcher(
-            TerminalPreference::Known(KnownTerminal::Konsole),
-            None,
-            None,
-        )
-        .resolve_with(path(), available(&[]))
-        .expect_err("missing terminal should fail");
-
-        assert!(matches!(error, LaunchError::MissingTerminal { .. }));
-        assert_eq!(error.to_string(), "Konsole was not found on PATH");
-    }
-
-    #[test]
-    fn auto_without_available_terminal_returns_clear_error() {
-        let error = launcher(TerminalPreference::Auto, None, None)
-            .resolve_with(path(), available(&[]))
-            .expect_err("missing terminals should fail");
-
-        assert!(matches!(error, LaunchError::NoSupportedTerminal));
-        assert_eq!(
-            error.to_string(),
-            "No supported terminal emulator was found"
-        );
-    }
-}
+mod tests;
