@@ -6,30 +6,122 @@ use std::process::{Command, Stdio};
 mod registry;
 pub use registry::{TerminalDefinition, TerminalRegistry};
 
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TerminalPreference {
     Auto,
     Known(KnownTerminal),
     Registered(String),
-    Custom,
+    Custom(String),
+    Unrecognised,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for TerminalPreference {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(1))?;
+        match self {
+            Self::Auto => map.serialize_entry("auto", &())?,
+            Self::Known(terminal) => map.serialize_entry("known", terminal)?,
+            Self::Registered(identifier) => map.serialize_entry("registered", identifier)?,
+            Self::Custom(command) => map.serialize_entry("custom", command)?,
+            Self::Unrecognised => {
+                return Err(<S::Error as serde::ser::Error>::custom(
+                    "an unrecognised terminal preference cannot be serialised",
+                ));
+            }
+        }
+        map.end()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TerminalPreference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(TerminalPreferenceVisitor)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct TerminalPreferenceVisitor;
+
+#[cfg(feature = "serde")]
+impl<'de> serde::de::Visitor<'de> for TerminalPreferenceVisitor {
+    type Value = TerminalPreference;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a single-entry terminal preference map")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: serde::de::MapAccess<'de>,
+    {
+        let kind = map
+            .next_key::<String>()?
+            .ok_or_else(|| <A::Error as serde::de::Error>::custom("missing terminal preference"))?;
+        let preference = match kind.as_str() {
+            "auto" => {
+                map.next_value::<()>()?;
+                TerminalPreference::Auto
+            }
+            "known" => TerminalPreference::Known(map.next_value()?),
+            "registered" => TerminalPreference::Registered(map.next_value()?),
+            "custom" => TerminalPreference::Custom(map.next_value()?),
+            _ => {
+                map.next_value::<serde::de::IgnoredAny>()?;
+                TerminalPreference::Unrecognised
+            }
+        };
+
+        if map.next_key::<serde::de::IgnoredAny>()?.is_some() {
+            return Err(<A::Error as serde::de::Error>::custom(
+                "terminal preferences must contain exactly one entry",
+            ));
+        }
+
+        Ok(preference)
+    }
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KnownTerminal {
+    #[cfg_attr(feature = "serde", serde(rename = "konsole"))]
     Konsole,
+    #[cfg_attr(feature = "serde", serde(rename = "gnome-terminal"))]
     GnomeTerminal,
+    #[cfg_attr(feature = "serde", serde(rename = "gnome-console"))]
     GnomeConsole,
+    #[cfg_attr(feature = "serde", serde(rename = "xfce4-terminal"))]
     Xfce4Terminal,
+    #[cfg_attr(feature = "serde", serde(rename = "mate-terminal"))]
     MateTerminal,
+    #[cfg_attr(feature = "serde", serde(rename = "lxterminal"))]
     Lxterminal,
+    #[cfg_attr(feature = "serde", serde(rename = "alacritty"))]
     Alacritty,
+    #[cfg_attr(feature = "serde", serde(rename = "ghostty"))]
     Ghostty,
+    #[cfg_attr(feature = "serde", serde(rename = "kitty"))]
     Kitty,
+    #[cfg_attr(feature = "serde", serde(rename = "wezterm"))]
     WezTerm,
+    #[cfg_attr(feature = "serde", serde(rename = "foot"))]
     Foot,
+    #[cfg_attr(feature = "serde", serde(rename = "xterm"))]
     Xterm,
+    #[cfg_attr(feature = "serde", serde(other, skip_serializing))]
+    Unrecognised,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +171,10 @@ impl TerminalPreference {
     pub fn registered(id: impl Into<String>) -> Self {
         Self::Registered(id.into())
     }
+
+    pub fn custom(command: impl Into<String>) -> Self {
+        Self::Custom(command.into())
+    }
 }
 
 #[derive(Debug)]
@@ -87,6 +183,7 @@ pub enum LaunchError {
     EmptyCustomCommand,
     MalformedCustomCommand(String),
     UnsupportedLaunchCommand { label: String },
+    UnsupportedTerminalPreference,
     NoSupportedTerminal,
     SpawnFailure { label: String, source: io::Error },
 }
@@ -99,6 +196,12 @@ impl fmt::Display for LaunchError {
             Self::MalformedCustomCommand(message) => write!(f, "{message}"),
             Self::UnsupportedLaunchCommand { label } => {
                 write!(f, "{label} does not support a structured launch command")
+            }
+            Self::UnsupportedTerminalPreference => {
+                write!(
+                    f,
+                    "The saved terminal preference is not supported by this version"
+                )
             }
             Self::NoSupportedTerminal => write!(f, "No supported terminal emulator was found"),
             Self::SpawnFailure { label, source } => write!(f, "Failed to open {label}: {source}"),
@@ -119,7 +222,6 @@ impl std::error::Error for LaunchError {
 pub struct TerminalLauncher {
     working_dir: Option<PathBuf>,
     preference: TerminalPreference,
-    custom_command: Option<String>,
     launch_command: Option<LaunchCommand>,
     detach_from_parent: bool,
     environment: TerminalEnvironment,
@@ -131,7 +233,6 @@ impl TerminalLauncher {
         Self {
             working_dir: None,
             preference: TerminalPreference::Auto,
-            custom_command: None,
             launch_command: None,
             detach_from_parent: false,
             environment: TerminalEnvironment::current(),
@@ -150,7 +251,7 @@ impl TerminalLauncher {
     }
 
     pub fn custom_command(mut self, command: impl Into<String>) -> Self {
-        self.custom_command = Some(command.into());
+        self.preference = TerminalPreference::custom(command);
         self
     }
 
@@ -205,14 +306,16 @@ impl TerminalLauncher {
         available: impl Fn(&str) -> bool,
     ) -> Result<ResolvedTerminalCommand, LaunchError> {
         match &self.preference {
-            TerminalPreference::Custom if self.launch_command.is_some() => {
+            TerminalPreference::Unrecognised
+            | TerminalPreference::Known(KnownTerminal::Unrecognised) => {
+                Err(LaunchError::UnsupportedTerminalPreference)
+            }
+            TerminalPreference::Custom(_) if self.launch_command.is_some() => {
                 Err(LaunchError::UnsupportedLaunchCommand {
                     label: "Terminal".to_string(),
                 })
             }
-            TerminalPreference::Custom => {
-                custom_terminal_command(self.custom_command.as_deref().unwrap_or_default(), path)
-            }
+            TerminalPreference::Custom(command) => custom_terminal_command(command, path),
             TerminalPreference::Auto => auto_terminal_command(
                 path,
                 self.launch_command.as_ref(),
@@ -276,7 +379,9 @@ impl TerminalEnvironment {
 
 pub fn terminal_label(preference: TerminalPreference) -> String {
     match preference {
-        TerminalPreference::Auto | TerminalPreference::Custom => "Terminal".to_string(),
+        TerminalPreference::Auto
+        | TerminalPreference::Custom(_)
+        | TerminalPreference::Unrecognised => "Terminal".to_string(),
         TerminalPreference::Known(terminal) => known_terminal_info(terminal)
             .map(|terminal| terminal.label)
             .unwrap_or("Terminal")
@@ -292,6 +397,10 @@ fn named_terminal_command(
     registry: &TerminalRegistry,
     available: &impl Fn(&str) -> bool,
 ) -> Result<ResolvedTerminalCommand, LaunchError> {
+    if terminal == KnownTerminal::Unrecognised {
+        return Err(LaunchError::UnsupportedTerminalPreference);
+    }
+
     let Some(definition) = registry.known(terminal) else {
         let terminal =
             known_terminal_info(terminal).expect("known terminal enum should have details");

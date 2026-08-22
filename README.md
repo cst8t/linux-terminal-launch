@@ -56,6 +56,31 @@ fn main() -> Result<(), linux_terminal_launch::LaunchError> {
 }
 ```
 
+## Custom terminal commands
+
+Use `custom_command()` when terminal-specific arguments cannot be represented by a registry
+definition. It selects the custom preference as well as setting the command.
+
+```rust
+use linux_terminal_launch::TerminalLauncher;
+
+fn main() -> Result<(), linux_terminal_launch::LaunchError> {
+    TerminalLauncher::new()
+        .working_dir("/home/user/project")
+        .custom_command("my-terminal --working-directory {path}")
+        .spawn()
+}
+```
+
+`TerminalPreference::custom()` provides the same preference for applications that persist or
+otherwise manage preferences separately from the launcher.
+
+## Serialised preferences
+
+With the optional `serde` feature, terminal preferences use stable, tagged identifiers. Unknown
+terminal and preference identifiers deserialise as an unsupported preference and cannot be
+serialised again, preventing a newer saved value from being silently replaced by an older version.
+
 ## Auto preference order
 
 `TerminalPreference::Auto` resolves the first available terminal in this order:

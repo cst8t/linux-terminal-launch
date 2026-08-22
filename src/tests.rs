@@ -13,7 +13,6 @@ fn launcher(
     TerminalLauncher {
         working_dir: Some(path().to_path_buf()),
         preference,
-        custom_command: None,
         launch_command: None,
         detach_from_parent: false,
         environment: TerminalEnvironment {
@@ -298,7 +297,7 @@ fn known_terminals_emit_expected_working_directory_arguments() {
                 "-e",
                 "sh",
                 "-lc",
-                "cd \"$1\" || exit; exec \"${SHELL:-sh}\"",
+                "cd -- \"$1\" || exit; exec -- \"${SHELL:-sh}\"",
                 "sh",
                 "/tmp/repo with spaces",
             ],
@@ -455,7 +454,7 @@ fn known_terminals_emit_expected_launch_command_arguments() {
                 "-e",
                 "sh",
                 "-lc",
-                "cd \"$1\" || exit; shift; exec \"$@\"",
+                "cd -- \"$1\" || exit; shift; exec -- \"$@\"",
                 "sh",
                 "/tmp/repo with spaces",
                 "cargo",
@@ -661,12 +660,10 @@ fn auto_rejects_x_terminal_emulator_with_launch_command() {
 
 #[test]
 fn custom_command_replaces_path_and_keeps_spaces() {
-    let command = TerminalLauncher {
-        custom_command: Some("my-terminal --working-directory \"{path}\" --flag".to_string()),
-        ..launcher(TerminalPreference::Custom, None, None)
-    }
-    .resolve_with(path(), available(&[]))
-    .expect("custom command should parse");
+    let command = launcher(TerminalPreference::Auto, None, None)
+        .custom_command("my-terminal --working-directory \"{path}\" --flag")
+        .resolve_with(path(), available(&[]))
+        .expect("custom command should parse");
 
     assert_eq!(command.program, "my-terminal");
     assert_eq!(
@@ -677,10 +674,11 @@ fn custom_command_replaces_path_and_keeps_spaces() {
 
 #[test]
 fn custom_command_can_omit_path_argument() {
-    let command = TerminalLauncher {
-        custom_command: Some("my-terminal --new-window".to_string()),
-        ..launcher(TerminalPreference::Custom, None, None)
-    }
+    let command = launcher(
+        TerminalPreference::custom("my-terminal --new-window"),
+        None,
+        None,
+    )
     .resolve_with(path(), available(&[]))
     .expect("custom command should parse");
 
@@ -690,24 +688,20 @@ fn custom_command_can_omit_path_argument() {
 
 #[test]
 fn custom_command_keeps_quoted_arguments_together() {
-    let command = TerminalLauncher {
-        custom_command: Some("my-terminal --title 'Repo Terminal'".to_string()),
-        ..launcher(TerminalPreference::Custom, None, None)
-    }
-    .resolve_with(path(), available(&[]))
-    .expect("custom command should parse");
+    let command = launcher(TerminalPreference::Auto, None, None)
+        .custom_command("my-terminal --title 'Repo Terminal'")
+        .resolve_with(path(), available(&[]))
+        .expect("custom command should parse");
 
     assert_eq!(command.args, vec!["--title", "Repo Terminal"]);
 }
 
 #[test]
 fn custom_command_rejects_unterminated_quotes() {
-    let error = TerminalLauncher {
-        custom_command: Some("my-terminal --title \"Repo".to_string()),
-        ..launcher(TerminalPreference::Custom, None, None)
-    }
-    .resolve_with(path(), available(&[]))
-    .expect_err("custom command should fail");
+    let error = launcher(TerminalPreference::Auto, None, None)
+        .custom_command("my-terminal --title \"Repo")
+        .resolve_with(path(), available(&[]))
+        .expect_err("custom command should fail");
 
     assert!(matches!(error, LaunchError::MalformedCustomCommand(_)));
     assert_eq!(
@@ -718,12 +712,10 @@ fn custom_command_rejects_unterminated_quotes() {
 
 #[test]
 fn custom_command_rejects_empty_command() {
-    let error = TerminalLauncher {
-        custom_command: Some("   ".to_string()),
-        ..launcher(TerminalPreference::Custom, None, None)
-    }
-    .resolve_with(path(), available(&[]))
-    .expect_err("custom command should fail");
+    let error = launcher(TerminalPreference::Auto, None, None)
+        .custom_command("   ")
+        .resolve_with(path(), available(&[]))
+        .expect_err("custom command should fail");
 
     assert!(matches!(error, LaunchError::EmptyCustomCommand));
     assert_eq!(error.to_string(), "Custom terminal command cannot be empty");
@@ -731,13 +723,11 @@ fn custom_command_rejects_empty_command() {
 
 #[test]
 fn custom_command_rejects_launch_command() {
-    let error = TerminalLauncher {
-        custom_command: Some("my-terminal --working-directory \"{path}\"".to_string()),
-        ..launcher(TerminalPreference::Custom, None, None)
-    }
-    .launch_command(launch_command())
-    .resolve_with(path(), available(&[]))
-    .expect_err("custom terminal should reject launch command");
+    let error = launcher(TerminalPreference::Auto, None, None)
+        .custom_command("my-terminal --working-directory \"{path}\"")
+        .launch_command(launch_command())
+        .resolve_with(path(), available(&[]))
+        .expect_err("custom terminal should reject launch command");
 
     assert!(matches!(
         error,
@@ -746,6 +736,102 @@ fn custom_command_rejects_launch_command() {
     assert_eq!(
         error.to_string(),
         "Terminal does not support a structured launch command"
+    );
+}
+
+#[test]
+fn preference_after_custom_command_takes_precedence() {
+    let command = launcher(TerminalPreference::Auto, None, None)
+        .custom_command("my-terminal --new-window")
+        .preference(TerminalPreference::Known(KnownTerminal::Konsole))
+        .resolve_with(path(), available(&["konsole"]))
+        .expect("last preference should resolve");
+
+    assert_eq!(command.program, "konsole");
+}
+
+#[test]
+fn unrecognised_terminal_preferences_fail_without_auto_fallback() {
+    let error = launcher(TerminalPreference::Unrecognised, None, None)
+        .resolve_with(path(), available(&["konsole"]))
+        .expect_err("unrecognised preference should fail");
+
+    assert!(matches!(error, LaunchError::UnsupportedTerminalPreference));
+
+    let error = launcher(
+        TerminalPreference::Known(KnownTerminal::Unrecognised),
+        None,
+        None,
+    )
+    .resolve_with(path(), available(&["konsole"]))
+    .expect_err("unrecognised terminal should fail");
+
+    assert!(matches!(error, LaunchError::UnsupportedTerminalPreference));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn serde_uses_stable_terminal_preference_identifiers() {
+    let cases = [
+        (TerminalPreference::Auto, r#"{"auto":null}"#),
+        (
+            TerminalPreference::Known(KnownTerminal::GnomeTerminal),
+            r#"{"known":"gnome-terminal"}"#,
+        ),
+        (
+            TerminalPreference::registered("coolterm"),
+            r#"{"registered":"coolterm"}"#,
+        ),
+        (
+            TerminalPreference::custom("coolterm --cwd {path}"),
+            r#"{"custom":"coolterm --cwd {path}"}"#,
+        ),
+    ];
+
+    for (preference, json) in cases {
+        assert_eq!(serde_json::to_string(&preference).unwrap(), json);
+        assert_eq!(
+            serde_json::from_str::<TerminalPreference>(json).unwrap(),
+            preference
+        );
+    }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn serde_rejects_unrecognised_preferences_when_serialising() {
+    let preference = serde_json::from_str::<TerminalPreference>(r#"{"future":null}"#)
+        .expect("unknown preference kind should deserialize");
+    assert_eq!(preference, TerminalPreference::Unrecognised);
+    assert!(serde_json::to_string(&preference).is_err());
+
+    let preference = serde_json::from_str::<TerminalPreference>(
+        r#"{"future":{"preserved-by-newer-version":true}}"#,
+    )
+    .expect("unknown preference with a value should deserialize");
+    assert_eq!(preference, TerminalPreference::Unrecognised);
+    assert!(serde_json::to_string(&preference).is_err());
+
+    let terminal = serde_json::from_str::<KnownTerminal>(r#""future-terminal""#)
+        .expect("unknown terminal should deserialize");
+    assert_eq!(terminal, KnownTerminal::Unrecognised);
+    assert!(serde_json::to_string(&terminal).is_err());
+
+    let preference = serde_json::from_str::<TerminalPreference>(r#"{"known":"future-terminal"}"#)
+        .expect("unknown known terminal should deserialize");
+    assert_eq!(
+        preference,
+        TerminalPreference::Known(KnownTerminal::Unrecognised)
+    );
+    assert!(serde_json::to_string(&preference).is_err());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn serde_rejects_malformed_known_terminal_preferences() {
+    assert!(serde_json::from_str::<TerminalPreference>(r#"{"known":1}"#).is_err());
+    assert!(
+        serde_json::from_str::<TerminalPreference>(r#"{"auto":null,"known":"konsole"}"#).is_err()
     );
 }
 

@@ -90,9 +90,9 @@ impl TerminalRegistry {
 
     pub fn label_for_preference(&self, preference: &crate::TerminalPreference) -> String {
         match preference {
-            crate::TerminalPreference::Auto | crate::TerminalPreference::Custom => {
-                "Terminal".to_string()
-            }
+            crate::TerminalPreference::Auto
+            | crate::TerminalPreference::Custom(_)
+            | crate::TerminalPreference::Unrecognised => "Terminal".to_string(),
             crate::TerminalPreference::Known(terminal) => known_terminal_info(*terminal)
                 .map(|terminal| terminal.label)
                 .unwrap_or("Terminal")
@@ -271,7 +271,7 @@ impl TerminalDefinition {
                 "-e".to_string(),
                 "sh".to_string(),
                 "-lc".to_string(),
-                "cd \"$1\" || exit; shift; exec \"$@\"".to_string(),
+                "cd -- \"$1\" || exit; shift; exec -- \"$@\"".to_string(),
                 "sh".to_string(),
                 path,
             ]
@@ -280,7 +280,7 @@ impl TerminalDefinition {
                 "-e".to_string(),
                 "sh".to_string(),
                 "-lc".to_string(),
-                "cd \"$1\" || exit; exec \"${SHELL:-sh}\"".to_string(),
+                "cd -- \"$1\" || exit; exec -- \"${SHELL:-sh}\"".to_string(),
                 "sh".to_string(),
                 path,
             ]
@@ -372,6 +372,7 @@ fn known_terminal_definition(terminal: KnownTerminal) -> Option<TerminalDefiniti
         KnownTerminal::Xterm => {
             TerminalDefinition::new(known_terminal_id(terminal), info.label, info.program).xterm()
         }
+        KnownTerminal::Unrecognised => return None,
     };
     Some(definition.known(terminal))
 }
@@ -390,6 +391,7 @@ fn known_terminal_id(terminal: KnownTerminal) -> &'static str {
         KnownTerminal::WezTerm => "wezterm",
         KnownTerminal::Foot => "foot",
         KnownTerminal::Xterm => "xterm",
+        KnownTerminal::Unrecognised => "unrecognised",
     }
 }
 
