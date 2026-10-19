@@ -581,19 +581,18 @@ fn auto_uses_xdg_terminal_exec_before_desktop_heuristic() {
 }
 
 #[test]
-fn auto_skips_xdg_terminal_exec_with_launch_command() {
+fn auto_prefers_xdg_terminal_exec_with_launch_command() {
     let command = launcher(TerminalPreference::Auto, None, Some("KDE"))
         .launch_command(launch_command())
         .resolve_with(path(), available(&["xdg-terminal-exec", "konsole"]))
-        .expect("known terminal should resolve");
+        .expect("XDG helper should resolve");
 
-    assert_eq!(command.program, "konsole");
+    assert_eq!(command.program, "xdg-terminal-exec");
     assert_eq!(
         command.args,
         vec![
-            "--workdir",
-            "/tmp/repo with spaces",
-            "-e",
+            "--dir=/tmp/repo with spaces",
+            "--",
             "cargo",
             "test",
             "--lib"
@@ -602,19 +601,199 @@ fn auto_skips_xdg_terminal_exec_with_launch_command() {
 }
 
 #[test]
-fn auto_rejects_xdg_terminal_exec_with_launch_command_when_no_known_terminal_exists() {
-    let error = launcher(TerminalPreference::Auto, None, None)
+fn auto_uses_xdg_terminal_exec_with_launch_command_when_no_known_terminal_exists() {
+    let command = launcher(TerminalPreference::Auto, None, None)
         .launch_command(launch_command())
         .resolve_with(path(), available(&["xdg-terminal-exec"]))
-        .expect_err("generic terminal should reject launch command");
+        .expect("XDG helper supports commands without a known terminal");
 
+    assert_eq!(command.program, "xdg-terminal-exec");
+    assert_eq!(
+        command.args,
+        vec![
+            "--dir=/tmp/repo with spaces",
+            "--",
+            "cargo",
+            "test",
+            "--lib"
+        ]
+    );
+}
+
+#[test]
+fn system_default_ignores_environment_and_registry_with_or_without_a_command() {
+    for launch_command in [None, Some(launch_command())] {
+        let mut selected = launcher(
+            TerminalPreference::SystemDefault,
+            Some("kitty"),
+            Some("KDE"),
+        );
+        selected.launch_command = launch_command;
+        let command = selected
+            .resolve_with(
+                path(),
+                available(&[
+                    "kitty",
+                    "konsole",
+                    "xdg-terminal-exec",
+                    "x-terminal-emulator",
+                ]),
+            )
+            .expect("system default should use XDG helper");
+        assert_eq!(command.program, "xdg-terminal-exec");
+        let expected = if selected.launch_command.is_some() {
+            vec![
+                "--dir=/tmp/repo with spaces",
+                "--",
+                "cargo",
+                "test",
+                "--lib",
+            ]
+        } else {
+            vec!["--dir=/tmp/repo with spaces"]
+        };
+        assert_eq!(command.args, expected);
+    }
+}
+
+#[test]
+fn system_default_falls_back_to_x_terminal_emulator_without_a_command() {
+    let command = launcher(
+        TerminalPreference::SystemDefault,
+        Some("kitty"),
+        Some("KDE"),
+    )
+    .resolve_with(
+        path(),
+        available(&["kitty", "konsole", "x-terminal-emulator"]),
+    )
+    .expect("alternatives helper should resolve");
+    assert_eq!(command.program, "x-terminal-emulator");
+    assert!(command.args.is_empty());
+}
+
+#[test]
+fn system_default_rejects_commands_with_only_x_terminal_emulator() {
+    let error = launcher(
+        TerminalPreference::SystemDefault,
+        Some("kitty"),
+        Some("KDE"),
+    )
+    .launch_command(launch_command())
+    .resolve_with(
+        path(),
+        available(&["kitty", "konsole", "x-terminal-emulator"]),
+    )
+    .expect_err("must not guess a terminal or forward commands to alternatives");
     assert!(matches!(
         error,
         LaunchError::UnsupportedLaunchCommand { .. }
     ));
+    assert!(
+        error
+            .to_string()
+            .contains("use xdg-terminal-exec to run commands")
+    );
+}
+
+#[test]
+fn system_default_requires_a_helper_even_when_known_terminals_are_available() {
+    for launch_command in [None, Some(launch_command())] {
+        let mut selected = launcher(
+            TerminalPreference::SystemDefault,
+            Some("kitty"),
+            Some("KDE"),
+        );
+        selected.launch_command = launch_command;
+        let error = selected
+            .resolve_with(path(), available(&["kitty", "konsole"]))
+            .expect_err("must not substitute an unrelated terminal");
+        assert!(matches!(error, LaunchError::MissingTerminal { .. }));
+        let guidance = if selected.launch_command.is_some() {
+            "install xdg-terminal-exec to run commands"
+        } else {
+            "install xdg-terminal-exec or x-terminal-emulator"
+        };
+        assert!(error.to_string().contains(guidance));
+    }
+}
+
+#[test]
+fn explicit_terminal_preferences_override_system_discovery() {
+    let cases = [
+        (TerminalPreference::Known(KnownTerminal::Kitty), "kitty"),
+        (TerminalPreference::registered("coolterm"), "coolterm"),
+        (
+            TerminalPreference::custom("customterm --new-window"),
+            "customterm",
+        ),
+    ];
+    for (preference, expected) in cases {
+        let command = launcher(preference, Some("konsole"), Some("KDE"))
+            .registry(
+                TerminalRegistry::with_known_terminals().register(
+                    TerminalDefinition::new("coolterm", "CoolTerm", "coolterm")
+                        .launch_command_separator("--"),
+                ),
+            )
+            .resolve_with(
+                path(),
+                available(&[
+                    "kitty",
+                    "coolterm",
+                    "customterm",
+                    "konsole",
+                    "xdg-terminal-exec",
+                ]),
+            )
+            .expect("explicit preference should win");
+        assert_eq!(command.program, expected);
+    }
+}
+
+#[test]
+fn missing_explicit_terminal_does_not_fall_back_to_system_helpers() {
+    for preference in [
+        TerminalPreference::Known(KnownTerminal::Kitty),
+        TerminalPreference::registered("coolterm"),
+    ] {
+        let error = launcher(preference, None, Some("KDE"))
+            .registry(
+                TerminalRegistry::with_known_terminals().register(
+                    TerminalDefinition::new("coolterm", "CoolTerm", "coolterm")
+                        .launch_command_separator("--"),
+                ),
+            )
+            .resolve_with(
+                path(),
+                available(&["konsole", "xdg-terminal-exec", "x-terminal-emulator"]),
+            )
+            .expect_err("missing explicit preference must fail");
+        assert!(matches!(error, LaunchError::MissingTerminal { .. }));
+    }
+}
+
+#[test]
+fn auto_still_prefers_terminal_environment_when_running_commands() {
+    let command = launcher(TerminalPreference::Auto, Some("kitty"), Some("KDE"))
+        .launch_command(launch_command())
+        .resolve_with(
+            path(),
+            available(&["kitty", "konsole", "xdg-terminal-exec"]),
+        )
+        .expect("TERMINAL keeps precedence in Auto");
+    assert_eq!(command.program, "kitty");
+}
+
+#[test]
+fn system_default_has_a_distinct_label() {
     assert_eq!(
-        error.to_string(),
-        "Terminal does not support a structured launch command"
+        terminal_label(TerminalPreference::SystemDefault),
+        "System default terminal"
+    );
+    assert_eq!(
+        TerminalRegistry::default().label_for_preference(&TerminalPreference::SystemDefault),
+        "System default terminal"
     );
 }
 
@@ -775,6 +954,10 @@ fn serde_uses_stable_terminal_preference_identifiers() {
     let cases = [
         (TerminalPreference::Auto, r#"{"auto":null}"#),
         (
+            TerminalPreference::SystemDefault,
+            r#"{"system-default":null}"#,
+        ),
+        (
             TerminalPreference::Known(KnownTerminal::GnomeTerminal),
             r#"{"known":"gnome-terminal"}"#,
         ),
@@ -801,24 +984,24 @@ fn serde_uses_stable_terminal_preference_identifiers() {
 #[test]
 fn serde_rejects_unrecognised_preferences_when_serialising() {
     let preference = serde_json::from_str::<TerminalPreference>(r#"{"future":null}"#)
-        .expect("unknown preference kind should deserialize");
+        .expect("unknown preference kind should deserialise");
     assert_eq!(preference, TerminalPreference::Unrecognised);
     assert!(serde_json::to_string(&preference).is_err());
 
     let preference = serde_json::from_str::<TerminalPreference>(
         r#"{"future":{"preserved-by-newer-version":true}}"#,
     )
-    .expect("unknown preference with a value should deserialize");
+    .expect("unknown preference with a value should deserialise");
     assert_eq!(preference, TerminalPreference::Unrecognised);
     assert!(serde_json::to_string(&preference).is_err());
 
     let terminal = serde_json::from_str::<KnownTerminal>(r#""future-terminal""#)
-        .expect("unknown terminal should deserialize");
+        .expect("unknown terminal should deserialise");
     assert_eq!(terminal, KnownTerminal::Unrecognised);
     assert!(serde_json::to_string(&terminal).is_err());
 
     let preference = serde_json::from_str::<TerminalPreference>(r#"{"known":"future-terminal"}"#)
-        .expect("unknown known terminal should deserialize");
+        .expect("unknown known terminal should deserialise");
     assert_eq!(
         preference,
         TerminalPreference::Known(KnownTerminal::Unrecognised)
@@ -829,6 +1012,11 @@ fn serde_rejects_unrecognised_preferences_when_serialising() {
 #[cfg(feature = "serde")]
 #[test]
 fn serde_rejects_malformed_known_terminal_preferences() {
+    assert!(serde_json::from_str::<TerminalPreference>(r#"{"system-default":1}"#).is_err());
+    assert!(
+        serde_json::from_str::<TerminalPreference>(r#"{"system-default":null,"auto":null}"#)
+            .is_err()
+    );
     assert!(serde_json::from_str::<TerminalPreference>(r#"{"known":1}"#).is_err());
     assert!(
         serde_json::from_str::<TerminalPreference>(r#"{"auto":null,"known":"konsole"}"#).is_err()

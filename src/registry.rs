@@ -90,6 +90,7 @@ impl TerminalRegistry {
 
     pub fn label_for_preference(&self, preference: &crate::TerminalPreference) -> String {
         match preference {
+            crate::TerminalPreference::SystemDefault => "System default terminal".to_string(),
             crate::TerminalPreference::Auto
             | crate::TerminalPreference::Custom(_)
             | crate::TerminalPreference::Unrecognised => "Terminal".to_string(),

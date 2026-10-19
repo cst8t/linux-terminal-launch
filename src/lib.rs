@@ -9,7 +9,13 @@ pub use registry::{TerminalDefinition, TerminalRegistry};
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TerminalPreference {
+    /// Discover a terminal using the environment, system helpers, and registry fallbacks.
     Auto,
+    /// Use system terminal helpers without consulting `TERMINAL` or registry fallbacks.
+    ///
+    /// Prefers `xdg-terminal-exec`. Falls back to `x-terminal-emulator` only when
+    /// no structured launch command is requested.
+    SystemDefault,
     Known(KnownTerminal),
     Registered(String),
     Custom(String),
@@ -27,6 +33,7 @@ impl serde::Serialize for TerminalPreference {
         let mut map = serializer.serialize_map(Some(1))?;
         match self {
             Self::Auto => map.serialize_entry("auto", &())?,
+            Self::SystemDefault => map.serialize_entry("system-default", &())?,
             Self::Known(terminal) => map.serialize_entry("known", terminal)?,
             Self::Registered(identifier) => map.serialize_entry("registered", identifier)?,
             Self::Custom(command) => map.serialize_entry("custom", command)?,
@@ -72,6 +79,10 @@ impl<'de> serde::de::Visitor<'de> for TerminalPreferenceVisitor {
             "auto" => {
                 map.next_value::<()>()?;
                 TerminalPreference::Auto
+            }
+            "system-default" => {
+                map.next_value::<()>()?;
+                TerminalPreference::SystemDefault
             }
             "known" => TerminalPreference::Known(map.next_value()?),
             "registered" => TerminalPreference::Registered(map.next_value()?),
@@ -316,6 +327,9 @@ impl TerminalLauncher {
                 })
             }
             TerminalPreference::Custom(command) => custom_terminal_command(command, path),
+            TerminalPreference::SystemDefault => {
+                system_default_terminal_command(path, self.launch_command.as_ref(), &available)
+            }
             TerminalPreference::Auto => auto_terminal_command(
                 path,
                 self.launch_command.as_ref(),
@@ -379,6 +393,7 @@ impl TerminalEnvironment {
 
 pub fn terminal_label(preference: TerminalPreference) -> String {
     match preference {
+        TerminalPreference::SystemDefault => "System default terminal".to_string(),
         TerminalPreference::Auto
         | TerminalPreference::Custom(_)
         | TerminalPreference::Unrecognised => "Terminal".to_string(),
@@ -443,6 +458,54 @@ fn registered_terminal_command(
     terminal.command(path, launch_command)
 }
 
+fn xdg_terminal_command(
+    path: &Path,
+    launch_command: Option<&LaunchCommand>,
+) -> ResolvedTerminalCommand {
+    let mut args = vec![format!("--dir={}", path.display())];
+    if let Some(command) = launch_command {
+        args.push("--".to_string());
+        args.push(command.program.clone());
+        args.extend(command.args.iter().cloned());
+    }
+    ResolvedTerminalCommand {
+        label: "Terminal".to_string(),
+        program: "xdg-terminal-exec".to_string(),
+        args,
+    }
+}
+
+fn system_default_terminal_command(
+    path: &Path,
+    launch_command: Option<&LaunchCommand>,
+    available: &impl Fn(&str) -> bool,
+) -> Result<ResolvedTerminalCommand, LaunchError> {
+    if available("xdg-terminal-exec") {
+        return Ok(xdg_terminal_command(path, launch_command));
+    }
+    if available("x-terminal-emulator") {
+        if launch_command.is_some() {
+            return Err(LaunchError::UnsupportedLaunchCommand {
+                label: "x-terminal-emulator (use xdg-terminal-exec to run commands)".to_string(),
+            });
+        }
+        return Ok(ResolvedTerminalCommand {
+            label: "System default terminal".to_string(),
+            program: "x-terminal-emulator".to_string(),
+            args: Vec::new(),
+        });
+    }
+    Err(LaunchError::MissingTerminal {
+        label: if launch_command.is_some() {
+            "System default terminal helper (install xdg-terminal-exec to run commands)"
+        } else {
+            "System default terminal helper (install xdg-terminal-exec or x-terminal-emulator)"
+        }
+        .to_string(),
+        program: "xdg-terminal-exec".to_string(),
+    })
+}
+
 fn auto_terminal_command(
     path: &Path,
     launch_command: Option<&LaunchCommand>,
@@ -477,15 +540,7 @@ fn auto_terminal_command(
     }
 
     if available("xdg-terminal-exec") {
-        if launch_command.is_some() {
-            found_unsupported_launcher = true;
-        } else {
-            return Ok(ResolvedTerminalCommand {
-                label: "Terminal".to_string(),
-                program: "xdg-terminal-exec".to_string(),
-                args: vec![format!("--dir={}", path.display())],
-            });
-        }
+        return Ok(xdg_terminal_command(path, launch_command));
     }
 
     for terminal in registry.desktop_terminals(environment.current_desktop.as_deref()) {
